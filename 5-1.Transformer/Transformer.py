@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import math
 
 # source_vocab_size: 原始的语言词表大小, 可以非常大
 # target_vocab_size: 翻译后语言词表大小, 可以非常大
@@ -42,24 +43,62 @@ def make_batch(sentences):
             torch.LongTensor(target_batch))
 
 
+class PositionalEncoding(nn.Module):
+    """
+    位置编码另一种实现
+    """
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+
+        # torch.Size([max_len, 1])
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        # torch.Size([d_model/2])
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
+        # torch.Size([max_len, d_model])
+        pe = torch.zeros(max_len, d_model)
+
+        # position * div_term: torch.Size([max_len, d_model/2])
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        '''
+        参数不更新时使用 register_buffer. 典型场景包括：
+        1) 当你有一个在模型训练过程中不会改变的张量, 但你又需要在模型的前向传播中使用它
+        2) 当你需要在多个地方访问同一个张量, 但又不希望它作为模型参数被优化器更新
+        注意: register_buffer注册后, 可以在forward中使用 self.pe 来操作pe
+        '''
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        x: [batch_size, seq_len]
+        @return: [batch_size, seq_len, d_model]
+        """
+        return self.pe[:x.size(0), :]
+
+
 def get_sinusoid_encoding_table(n_position, d_model):
     """
     正弦编码是一种常见的位置编码方法，它利用正弦函数的周期性来编码位置信息
-    :param n_position:
-    :param d_model:
-    :return:
+    @param n_position: 位置的总个数
+    @param d_model:    编码后的向量长度
+    @return:           每个位置对应一个编码向量. torch.Size([n_position, d_model])
     """
     def cal_angle(position, hid_idx):
+        # 注意: hid_idx // 2 导致每列数据会重复两次
         return position / np.power(10000, 2 * (hid_idx // 2) / d_model)
 
     def get_posi_angle_vec(position):
         return [cal_angle(position, hid_j) for hid_j in range(d_model)]
 
-    sinusoid_table = np.array([get_posi_angle_vec(pos_i) for pos_i in range(n_position)])
+    # 二维数组
+    sinusoid_table = [get_posi_angle_vec(pos) for pos in range(n_position)]
+    sinusoid_table = np.array(sinusoid_table)
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
     print(f"sinusoid_table : {sinusoid_table}, size: {sinusoid_table.shape}") # (n_position, d_model)
-
     return torch.FloatTensor(sinusoid_table)
 
 
@@ -114,7 +153,7 @@ def get_attn_subsequent_mask(seq):
     return subsequent_mask
 
 
-def showgraph(attn, text):
+def show_graph(attn, text):
     """
     最后一层的 第一个head的 注意力权重的可视化
     :param attn: List[[batch_size, heads, len_q, len_k]]
@@ -266,9 +305,12 @@ class Encoder(nn.Module):
         self.src_emb = nn.Embedding(src_vocab_size, d_model)
 
         # 输入词序列的位置编码矩阵, [src_seq_len, d_model]
-        self.pos_emb = nn.Embedding.from_pretrained(
-            get_sinusoid_encoding_table(src_seq_len, d_model),
-            freeze=True)
+        # 方式一
+        # self.pos_emb = nn.Embedding.from_pretrained(
+        #     get_sinusoid_encoding_table(src_seq_len, d_model),
+        #     freeze=True)
+        # 方式二
+        self.pos_emb = PositionalEncoding(d_model=d_model, max_len=src_seq_len)
 
         # N个EncoderBlock的堆叠
         self.layers = nn.ModuleList([EncoderLayer() for _ in range(n_layers)])

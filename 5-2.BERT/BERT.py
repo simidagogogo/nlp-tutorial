@@ -15,28 +15,41 @@
 
 import math
 import re
-from random import *
+import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import copy
+from typing import List, Dict
 
+# 设置随机数种子, 保证每次执行结果相同(主要是日志一致)
+random.seed("luck")
 
-def show_words(input_ids, number_dict):
+"""
+word: word的明文值
+token: word的编码值 
+"""
+
+def show_words(input_ids: List[int], number_dict: Dict[int, str]):
     res = []
     for i in input_ids:
         # print(f"{i} -> {number_dict[i]}")
         res.append(number_dict[i])
     return res
 
-def make_batch(sentences, token_list, max_pred, number_dict):
+def make_batch(sentences: List[str],
+               token_list: List[List[int]],
+               max_pred: int,
+               token_2_word_dict: Dict[int, str],
+               word_2_token_dict: Dict[str, int]):
     """
     sample IsNext and NotNext to be same in small batch size
     @sentences: List[str]
-    @token_list: List[List[bigint]]
+    @token_list: List[List[int]]
     @max_pred: 最大预测长度
-    @number_dict: 词典index -> word
+    @number_dict: index -> token
+    @word_dict: token-> index, 包含特殊token
     :return:
         input_ids: 长度为maxlen的token_id序列
         segment_ids: 长度为maxlen的seg_id序列
@@ -47,70 +60,83 @@ def make_batch(sentences, token_list, max_pred, number_dict):
     assert batch_size % 2 == 0, "batch_size must be even"
 
     batch = []
-    input_ids_mask_batch = []
+    input_ids_mask_batch: List[List[str]] = []
     positive = 0
     negative = 0
+    vocab_size = len(word_2_token_dict)
 
     # 正负样本的比例一致, 即各为50^
     while positive != batch_size / 2 or negative != batch_size / 2:
         # sample random index(0~len(sentences)-1) in sentences
-        tokens_a_index = randrange(len(sentences))
-        tokens_b_index = randrange(len(sentences))
+        tokens_a_index = random.randrange(len(sentences))
+        tokens_b_index = random.randrange(len(sentences))
 
         # 随机选取两个句子
-        tokens_a = token_list[tokens_a_index]
-        tokens_b = token_list[tokens_b_index]
+        tokens_a: List[int] = token_list[tokens_a_index]
+        tokens_b: List[int] = token_list[tokens_b_index]
 
-        # 构造输入的sequence ids
-        # [1, 17, 19, 7, 2, 4, 25, 19, 13, 27, 28, 19, 6, 2]
-        input_ids = [word_dict['[CLS]']] + tokens_a + [word_dict['[SEP]']] + tokens_b + [word_dict['[SEP]']]
+        # 构造输入的sequence ids. 格式: CLS + seqA + SEP + seqB + SEP + PAD
+        input_ids: List[int] = [word_2_token_dict['[CLS]']] + tokens_a + [word_2_token_dict['[SEP]']] + tokens_b + [word_2_token_dict['[SEP]']]
+        input_ids_bak: List[int] = copy.deepcopy(input_ids) # 由于后面会修改input_ids的值, 因此这里提前做一个备份
 
-        # 记录mask的操作: NOTHIT/MASK/RANDOM/NOTHING/PAD
-        input_ids_mask = ["NOTHIT"] * len(input_ids)
+        # sequences -> ['[CLS]', 'hello', 'romeo', 'my', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]', 'hello', 'romeo', 'my', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]']
+        print(f"\n[make_batch()]. before sequences -> {show_words(input_ids, token_2_word_dict)}")
 
-        # 由于后面会修改input_ids的值, 因此这里提前做一个备份
-        input_ids_bak = copy.deepcopy(input_ids)
-        print(f"input_ids_bak: {input_ids_bak}")
-
-        # ['[CLS]', 'thanks', 'you', 'romeo', '[SEP]', 'nice', 'meet', 'you', 'too', 'how', 'are', 'you', 'today', '[SEP]']
-        print(f"sequences -> {show_words(input_ids, number_dict)}")
+        # 记录mask的操作: ----/MASK/RANDOM/NOTHING/PAD
+        # ----: 没有命中预测token
+        # MASK:     命中预测token, mask
+        # RANDOM:   命中预测token, 随机替换
+        # NOTHING   命中预测token, 不变
+        # PAD:      填充以对齐长度
+        input_ids_mask: List[str] = ["----"] * len(input_ids)
 
         # segment0表示A, 包括CLS和SEP. segment1表示B, 包括SEP
-        segment_ids = [0] * (1 + len(tokens_a) + 1) + [1] * (len(tokens_b) + 1)
+        segment_ids: List[int] = [0] * (1 + len(tokens_a) + 1) + [1] * (len(tokens_b) + 1)
 
         # MASK LM
         n_pred = min(max_pred, max(1, int(round(len(input_ids) * 0.15))))  # 15 % of tokens in one sentence
         print(f"n_pred: {n_pred}")
 
-        # 可以进行mask的token_id位置
-        cand_maked_pos = [i for i, token in enumerate(input_ids) if token != word_dict['[CLS]'] and token != word_dict['[SEP]']]
+        # 可以进行mask的token_id位置(不包括CLS和SEP)
+        cand_maked_pos: List[int] = [i for i, token in enumerate(input_ids) if token != word_2_token_dict['[CLS]'] and token != word_2_token_dict['[SEP]']]
+        cand_maked_token: List[int] = [token for i, token in enumerate(input_ids) if token != word_2_token_dict['[CLS]'] and token != word_2_token_dict['[SEP]']]
+        not_cand_maked_token: List[int] = [token for i, token in enumerate(input_ids) if token == word_2_token_dict['[CLS]'] or token == word_2_token_dict['[SEP]']]
         print(f"cand_maked_pos: {cand_maked_pos}")
+        print(f"cand_maked_tokens: {show_words(cand_maked_token, token_2_word_dict)}")
+        print(f"not_cand_maked_tokens: {show_words(not_cand_maked_token, token_2_word_dict)}")
 
         # 这个shuffle有什么必要? 要随机的算出n_pred个
-        shuffle(cand_maked_pos)
+        random.shuffle(cand_maked_pos)
 
         # 随机选取n_pred个位置进行MASK
-        masked_tokens = []
-        masked_pos = []
+        masked_tokens: List[int] = []
+        masked_pos: List[int] = []
         for pos in cand_maked_pos[:n_pred]:
-            print(f"masked_pos: {pos}, masked_token: {input_ids[pos]}")
             masked_pos.append(pos)
             masked_tokens.append(input_ids[pos])
             # 对于命中预估的15%:
             #   80%的概率做MASK,
             #   10%的概率做随机替换
             #   10%的概率不做任何变化
-            if random() < 0.8:  # 80%
-                input_ids[pos] = word_dict['[MASK]']  # make mask
+            before_token = token_2_word_dict[input_ids[pos]] # 记录原始token
+            if random.random() < 0.8:  # 80%
+                input_ids[pos] = word_2_token_dict['[MASK]']  # make mask
                 input_ids_mask[pos] = "MASK"
-            elif random() < 0.5:  # 10%
-                index = randint(0, vocab_size - 1)  # random index in vocabulary
-                input_ids[pos] = word_dict[number_dict[index]]  # replace
+                print(f"masked_pos: {pos}, masked_token_idx: {input_ids[pos]}, masked_token: {before_token}, type: MASK({token_2_word_dict[input_ids[pos]]})")
+            elif random.random() < 0.5:  # 10%
+                # random index in vocabulary
+                # 注意: 应该从4开始, 因为前四个都是特殊符号
+                input_ids[pos] = random.randint(4, vocab_size - 1)  # replace
                 input_ids_mask[pos] = "RANDOM"
+                print(f"masked_pos: {pos}, masked_token_idx: {input_ids[pos]}, masked_token: {before_token}, type: RANDOM({token_2_word_dict[input_ids[pos]]})")
             else:
                 # 不做任何变化
                 input_ids_mask[pos] = "NOTHING"
-                pass
+                print(f"masked_pos: {pos}, masked_token_idx: {input_ids[pos]}, masked_token: {before_token}, type: NOTHING({token_2_word_dict[input_ids[pos]]})")
+
+        # masked_pos: 8, masked_token_idx: 3, masked_token: to, type: MASK([MASK])
+        # masked_pos: 14, masked_token_idx: 3, masked_token: my, type: MASK([MASK])
+        # masked_pos: 4, masked_token_idx: 13, masked_token: name, type: RANDOM(is)
 
         # Zero Paddings
         # 针对整个句子维度的padding
@@ -120,6 +146,9 @@ def make_batch(sentences, token_list, max_pred, number_dict):
         segment_ids.extend([0] * n_pad)
         input_ids_mask.extend(["PAD"] * n_pad)
 
+        # [make_batch()]. after sequences -> ['[CLS]', 'hello', 'romeo', 'my', 'is', 'is', 'juliet', 'nice', '[MASK]', 'meet', 'you', '[SEP]', 'hello', 'romeo', '[MASK]', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]']
+        print(f"\n[make_batch()]. after sequences -> {show_words(input_ids, token_2_word_dict)}")
+
         # Zero Padding (100% - 15%) tokens
         # 针对masked tokens维度的padding
         if max_pred > n_pred:
@@ -127,21 +156,18 @@ def make_batch(sentences, token_list, max_pred, number_dict):
             masked_tokens.extend([0] * n_pad)
             masked_pos.extend([0] * n_pad)
 
-
         # 判断正负样本
         if tokens_a_index + 1 == tokens_b_index and positive < batch_size / 2:
             batch.append([input_ids_bak, input_ids, segment_ids, masked_tokens, masked_pos, True])  # IsNext
             input_ids_mask_batch.append(input_ids_mask)
-            print(f"input_ids_mask: {input_ids_mask}")
+            print(f"positive. masked_tokens: {show_words(masked_tokens, token_2_word_dict)}")
             positive += 1
         elif tokens_a_index + 1 != tokens_b_index and negative < batch_size / 2:
             batch.append([input_ids_bak, input_ids, segment_ids, masked_tokens, masked_pos, False])  # NotNext
             input_ids_mask_batch.append(input_ids_mask)
-            print(f"input_ids_mask: {input_ids_mask}")
+            # negative. masked_tokens: ['to', 'my', 'name', '[PAD]', '[PAD]']
+            print(f"negative. masked_tokens: {show_words(masked_tokens, token_2_word_dict)}")
             negative += 1
-
-    print(f"fuck. input_ids_mask_batch: {input_ids_mask_batch}")
-    print(f"fuck. len(input_ids_mask_batch): {len(input_ids_mask_batch)}")
     return input_ids_mask_batch, batch
 
 
@@ -184,7 +210,7 @@ class Embedding(nn.Module):
         # [vocab_size, d_model]
         self.token_embed = nn.Embedding(vocab_size, d_model)
 
-        # position embedding
+        # position embedding(交给模型去学习)
         # [max_len, d_model]
         self.pos_embed = nn.Embedding(maxlen, d_model)
 
@@ -197,8 +223,9 @@ class Embedding(nn.Module):
 
     def forward(self, x, seg):
         """
-        :x: [batch_size, seq_len], 第二维的取值为0~vocab_size-1
-        :seg: [batch_size, seq_len], 第二维的取值为0,1
+        @params: x [batch_size, seq_len], 第二维的取值为0~vocab_size-1
+        @params: seg: [batch_size, seq_len], 第二维的取值为0,1
+        @return: [batch_size, seq_len, d_model]
         """
         # 获取seqence长度
         seq_len = x.size(1)
@@ -214,6 +241,7 @@ class Embedding(nn.Module):
         embedding = self.token_embed(x) + self.pos_embed(pos) + self.seg_embed(seg)
 
         # LN层
+        # [batch_size, seq_len, d_model]
         return self.norm(embedding)
 
 
@@ -315,7 +343,7 @@ class PoswiseFeedForwardNet(nn.Module):
 
 class EncoderLayer(nn.Module):
     """
-    编码器层
+    编码器(BERT的堆叠层)
     """
     def __init__(self):
         super(EncoderLayer, self).__init__()
@@ -388,7 +416,7 @@ class BERT(nn.Module):
         :segment_ids: [batch_size, maxlen], 长度为maxlen的seg_id序列
         :masked_pos:  [batch_size, max_pred], 长度为max_pred的的token_id_pos序列
         :return:
-            语言模型LM输出 logits_lm:   [batch_size, max_pred, n_vocab]
+            语言模型MLM输出 logits_lm:   [batch_size, max_pred, n_vocab]
             分类CLS输出   logits_clsf: [batch_size, 2]
         """
         # Step1. input_emb
@@ -403,7 +431,7 @@ class BERT(nn.Module):
         for layer in self.layers:
             output, enc_self_attn = layer(output, enc_self_attn_mask)
 
-        # Step3.1 语言模型LM的输出 (预测每个被masked的token是什么)
+        # ========= 语言模型LM的输出 (预测每个被masked的token是什么) =========
         # masked_pos: [batch_size, max_pred, d_model]
         masked_pos = masked_pos[:, :, None].expand(-1, -1, output.size(-1))
 
@@ -422,7 +450,7 @@ class BERT(nn.Module):
         # logits_lm: [batch_size, max_pred, n_vocab]
         logits_lm = self.decoder(h_masked) + self.decoder_bias
 
-        # Step3.2 分类CLS的输出
+        # ========= 分类CLS的输出 =========
         # 第一个token（[CLS] token）表示进行分类任务, 这个向量用于聚合整个输入序列的信息，并作为分类任务（如情感分析、问答等）的输入
         # h_pooled: [batch_size, d_model]
         h_pooled = self.tanh(self.fc1(output[:, 0, :])) # output[:, 0] == output[:, 0, :]
@@ -473,54 +501,70 @@ if __name__ == '__main__':
     )
 
     # filter '.', ',', '?', '!'
-    # ['hello how are you i am romeo',
+    # [
+    #  'hello how are you i am romeo',
     #  'hello romeo my name is juliet nice to meet you',
     #  'nice meet you too how are you today',
     #  'great my baseball team won the competition',
     #  'oh congratulations juliet',
     #  'thanks you romeo'
-    #  ]
-    sentences = re.sub("[.,!?\\-]", '', text.lower()).split('\n')
+    # ]
+    sentences: List[str] = re.sub("[.,!?\\-]", '', text.lower()).split('\n')
 
     # 全部训练样本的token
     # ['congratulations', 'i', 'meet', 'too', 'is', 'how', 'name', 'nice', 'thanks', 'today', 'baseball', 'won', 'am', 'the', 'you', 'team', 'great', 'oh', 'my', 'romeo', 'juliet', 'are', 'to', 'hello', 'competition']
-    word_list = list(set(" ".join(sentences).split()))
+    word_list: List[str] = list(set(" ".join(sentences).split()))
+    # 按照字典序排序, 以固定word_dict的编码顺序
+    word_list.sort()
 
     # 词表(token -> index)
-    word_dict = {
+    word_2_token_dict = {
         '[PAD]': 0,
         '[CLS]': 1,
         '[SEP]': 2,
         '[MASK]': 3
     }
-
     # 前4个索引已经被上述特殊标记占用，故从4开始
     for i, w in enumerate(word_list):
-        word_dict[w] = i + 4
-    print(f"word_dict: {word_dict}")
+        word_2_token_dict[w] = i + 4
+    print(f"word_2_token_dict: {word_2_token_dict}")
+    # word_2_token_dict: {'[PAD]': 0, '[CLS]': 1, '[SEP]': 2, '[MASK]': 3, 'am': 4, 'are': 5, 'baseball': 6, 'competition': 7, 'congratulations': 8, 'great': 9, 'hello': 10, 'how': 11, 'i': 12, 'is': 13, 'juliet': 14, 'meet': 15, 'my': 16, 'name': 17, 'nice': 18, 'oh': 19, 'romeo': 20, 'team': 21, 'thanks': 22, 'the': 23, 'to': 24, 'today': 25, 'too': 26, 'won': 27, 'you': 28}
 
-    # index -> word
-    number_dict = {i: w for i, w in enumerate(word_dict)}
-    print(f"number_dict: {number_dict}")
+    # index -> token
+    token_2_word_dict: Dict[int, str] = {v : k for k, v in word_2_token_dict.items()}
+    print(f"token_2_word_dict: {token_2_word_dict}")
+    # number_dict: {0: '[PAD]', 1: '[CLS]', 2: '[SEP]', 3: '[MASK]', 4: 'am', 5: 'are', 6: 'baseball', 7: 'competition', 8: 'congratulations', 9: 'great', 10: 'hello', 11: 'how', 12: 'i', 13: 'is', 14: 'juliet', 15: 'meet', 16: 'my', 17: 'name', 18: 'nice', 19: 'oh', 20: 'romeo', 21: 'team', 22: 'thanks', 23: 'the', 24: 'to', 25: 'today', 26: 'too', 27: 'won', 28: 'you'}
 
     # 词表大小
-    vocab_size = len(word_dict)
+    vocab_size = len(word_2_token_dict)
 
     # 每个句子对应一个sequence序列
-    token_list = list()
+    sequence_lists: List[List[int]] = list()
+    words_lists: List[List[str]] = list()
     for sentence in sentences:
         # sequence序列
-        arr = [word_dict[s] for s in sentence.split()]
-        token_list.append(arr)
+        arr = [word_2_token_dict[s] for s in sentence.split()]
+        arr2 = [s for s in sentence.split()]
+        sequence_lists.append(arr)
+        words_lists.append(arr2)
 
-    # token_list:
-    # [[7, 24, 17, 26, 4, 20, 9],
-    #  [7, 9, 27, 28, 6, 8, 14, 12, 5, 26],
-    #  [14, 5, 26, 22, 24, 17, 26, 25],
-    #  [21, 27, 18, 23, 13, 11, 19],
-    #  [10, 16, 8],
-    #  [15, 26, 9]]
-    print(f"token_list: {token_list}")
+    # [[10, 11, 5, 28, 12, 4, 20],
+    #  [10, 20, 16, 17, 13, 14, 18, 24, 15, 28],
+    #  [18, 15, 28, 26, 11, 5, 28, 25],
+    #  [9, 16, 6, 21, 27, 23, 7],
+    #  [19, 8, 14],
+    #  [22, 28, 20]
+    # ]
+    print(f"sequence_lists: {sequence_lists}")
+
+    # [['hello', 'how', 'are', 'you', 'i', 'am', 'romeo'],
+    #  ['hello', 'romeo', 'my', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you'],
+    #  ['nice', 'meet', 'you', 'too', 'how', 'are', 'you', 'today'],
+    #  ['great', 'my', 'baseball', 'team', 'won', 'the', 'competition'],
+    #  ['oh', 'congratulations', 'juliet'],
+    #  ['thanks', 'you', 'romeo']
+    # ]
+    print(f"words_lists: {words_lists}")
 
     # 构造模型
     model = BERT()
@@ -537,65 +581,61 @@ if __name__ == '__main__':
     # masked_tokens: 长度为max_pred的的token_id序列
     # masked_pos: 长度为max_pred的的token_id_pos序列
     # isNext: 是否下一个segment
-    input_ids_mask_batch, batch = make_batch(sentences, token_list, max_pred, number_dict)
+    input_ids_mask_batch, batch = make_batch(sentences, sequence_lists, max_pred, token_2_word_dict, word_2_token_dict)
     input_ids_bak, input_ids, segment_ids, masked_tokens, masked_pos, isNext = map(torch.LongTensor, zip(*batch))
     print(f"segment_ids.shape: {segment_ids.shape}")    # torch.Size([6, 30])
     print(f"input_ids.shape: {input_ids.shape}")        # torch.Size([6, 30])
     print(f"masked_tokens.shape: {masked_tokens.shape}") # torch.Size([6, 5])
     print(f"masked_pos.shape: {masked_pos.shape}")      # torch.Size([6, 5])
+    print(f"isNext.shape: {isNext.shape}")      # torch.Size([6])
 
-    print(f"segment_ids: {segment_ids}")
-    # tensor([[0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    #         [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    #         [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    #         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    #         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    #         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+    # print(f"segment_ids: {segment_ids}")
     print(f"input_ids_bak: {input_ids_bak}")
-    tensor([[1, 25, 14, 7, 5, 17, 28, 19, 2, 6, 26, 12, 2, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 4, 5, 19, 2, 21, 22, 11, 20, 16, 10, 27, 2, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 25, 19, 22, 8, 9, 12, 15, 18, 13, 5, 2, 6, 26, 12, 2, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 6, 26, 12, 2, 4, 5, 19, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 15, 13, 5, 24, 14, 7, 5, 23, 2, 21, 22, 11, 20, 16, 10, 27, 2,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 21, 22, 11, 20, 16, 10, 27, 2, 6, 26, 12, 2, 0, 0, 0, 0, 0,
-             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
-    print(f"fuck you. input_ids_mask_batch: {input_ids_mask_batch}")
-    [['NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'],
-     ['NOTHIT', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'],
-     ['NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'RANDOM', 'NOTHIT', 'NOTHIT', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'],
-     ['NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'],
-     ['NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'MASK', 'NOTHIT', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'],
-     ['NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'NOTHIT', 'MASK', 'NOTHIT', 'NOTHIT', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD']]
-    print(f"fuck you. len(input_ids_mask_batch): {len(input_ids_mask_batch)}")
+    # tensor([[ 1, 10, 20, 16, 17, 13, 14, 18, 24, 15, 28,  2, 10, 20, 16, 17, 13, 14,
+    #          18, 24, 15, 28,  2,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1,  9, 16,  6, 21, 27, 23,  7,  2, 19,  8, 14,  2,  0,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 10, 11,  5, 28, 12,  4, 20,  2, 22, 28, 20,  2,  0,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 18, 15, 28, 26, 11,  5, 28, 25,  2, 19,  8, 14,  2,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 19,  8, 14,  2, 22, 28, 20,  2,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 18, 15, 28, 26, 11,  5, 28, 25,  2,  9, 16,  6, 21, 27, 23,  7,  2,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]])
 
     print(f"input_ids: {input_ids}")
-    tensor([[1, 3, 14, 7, 3, 17, 28, 19, 2, 6, 26, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 4, 5, 3, 2, 21, 22, 3, 20, 16, 10, 27, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 25, 19, 22, 3, 9, 12, 15, 18, 13, 5, 2, 6, 25, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 3, 26, 12, 2, 4, 5, 19, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 15, 13, 5, 24, 14, 7, 5, 23, 2, 3, 22, 11, 20, 3, 10, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 3, 22, 11, 20, 16, 10, 27, 2, 6, 3, 12, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+    # tensor([[ 1, 10, 20, 16, 13, 13, 14, 18,  3, 15, 28,  2, 10, 20,  3, 17, 13, 14,
+    #          18, 24, 15, 28,  2,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1,  9, 16,  6, 21,  3, 23,  7,  2, 19,  8,  3,  2,  0,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 10,  3,  5,  3, 12,  4, 20,  2, 22, 28, 20,  2,  0,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1,  3, 15, 28, 26, 11,  5, 28, 25,  2,  3,  8, 14,  2,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 19,  8, 14,  2,  3, 28, 20,  2,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    #         [ 1, 18, 15, 28,  3, 11,  5, 28, 25,  2,  9, 16,  6, 21, 27,  3,  7,  2,
+    #           0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]])
+
+    print(f"fuck you. input_ids_mask_batch: {input_ids_mask_batch}")
+    # [['----', '----', '----', '----', 'RANDOM', '----', '----', '----', 'MASK', '----', '----', '----', '----', '----', 'MASK', '----', '----', '----', '----', '----', '----', '----', '----', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'], ['----', '----', '----', '----', '----', 'MASK', '----', '----', '----', '----', '----', 'MASK', '----', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'], ['----', '----', 'MASK', '----', 'MASK', '----', '----', '----', '----', '----', '----', '----', '----', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'], ['----', 'MASK', '----', '----', '----', '----', '----', '----', '----', '----', 'MASK', '----', '----', '----', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'], ['----', '----', '----', '----', '----', 'MASK', '----', '----', '----', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD'], ['----', '----', '----', '----', 'MASK', 'NOTHING', '----', '----', '----', '----', '----', '----', '----', '----', '----', 'MASK', '----', '----', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD', 'PAD']]
 
     print(f"masked_tokens: {masked_tokens}")
+    # tensor([[24, 16, 17,  0,  0],
+    #         [27, 14,  0,  0,  0],
+    #         [28, 11,  0,  0,  0],
+    #         [18, 19,  0,  0,  0],
+    #         [22,  0,  0,  0,  0],
+    #         [23, 26, 11,  0,  0]])
 
     print(f"masked_pos: {masked_pos}")
-    masked_tokens: tensor([[25, 5, 0, 0, 0],
-                           [19, 11, 0, 0, 0],
-                           [8, 26, 0, 0, 0],
-                           [6, 0, 0, 0, 0],
-                           [21, 27, 16, 0, 0],
-                           [26, 21, 0, 0, 0]])
-    masked_pos: tensor([[1, 4, 0, 0, 0],
-                        [3, 7, 0, 0, 0],
-                        [4, 13, 0, 0, 0],
-                        [1, 0, 0, 0, 0],
-                        [10, 16, 14, 0, 0],
-                        [10, 1, 0, 0, 0]])
+    # tensor([[ 8, 14,  4,  0,  0],
+    #         [ 5, 11,  0,  0,  0],
+    #         [ 4,  2,  0,  0,  0],
+    #         [ 1, 10,  0,  0,  0],
+    #         [ 5,  0,  0,  0,  0],
+    #         [15,  4,  5,  0,  0]])
 
     for epoch in range(100):
         # Step1. 梯度清零
@@ -608,19 +648,22 @@ if __name__ == '__main__':
 
         # Step3. 计算损失
         # Step3.1 for masked LM
-        loss_lm = criterion(logits_lm.transpose(1, 2), masked_tokens)
-        print(f"debug. loss_lm.shape: {loss_lm.shape}")
-        # debug. loss_lm.shape: torch.Size([])
+        # logits_lm.transpose(1, 2): [batch_size, max_pred, n_vocab]
+        # masked_tokens:             [batch_size, max_pred]
+        loss_lm = criterion(logits_lm.transpose(1, 2), masked_tokens) # torch.Size([])
+        # 由于loss_lm是标量, .mean()实际上不会改变值, 但从张量转换为标量, 以便后续的反向传播和优化步骤
         loss_lm = (loss_lm.float()).mean()
 
         # Step3.2 for sentence classification
+        # logits_clsf: [batch_size, 2]
+        # isNext: torch.Size([batch_size])
         loss_clsf = criterion(logits_clsf, isNext)
 
         # Step3.3 total loss
         loss = loss_lm + loss_clsf
 
         if (epoch + 1) % 10 == 0:
-            print('Epoch:', '%04d' % (epoch + 1), 'cost =', '{:.6f}'.format(loss))
+            print('Epoch:', '%04d' % (epoch + 1), 'loss =', '{:.6f}'.format(loss))
 
         # Step4. 反向传播
         loss.backward()
@@ -635,36 +678,45 @@ if __name__ == '__main__':
     # masked_tokens: 长度为max_pred的的token_id序列
     # masked_pos: 长度为max_pred的的token_id_pos序列
     # isNext: 是否下一个segment
-    input_ids_bak, input_ids_mask, input_ids, segment_ids, masked_tokens, masked_pos, isNext = map(torch.LongTensor, zip(batch[0]))
+    input_ids_bak, input_ids, segment_ids, masked_tokens, masked_pos, isNext = map(torch.LongTensor, zip(batch[0]))
+    print(f"debug. input_ids_bak: {input_ids_bak}")
+    # tensor([[ 1, 10, 20, 16, 17, 13, 14, 18, 24, 15, 28,  2, 10, 20, 16, 17, 13, 14, 18, 24, 15, 28,  2,  0,  0,  0,  0,  0,  0,  0]])
     print(f"debug. input_ids: {input_ids}")
-    # debug. input_ids: tensor(
-    #   [[ 1,  3, 18,  3, 21, 25, 10, 23, 17,  6, 13,  2, 19, 27, 10,  2,  0,  0,
-    #      0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]]
-    # )
+    # tensor([[ 1, 10, 20, 16, 13, 13, 14, 18,  3, 15, 28,  2, 10, 20,  3, 17, 13, 14, 18, 24, 15, 28,  2,  0,  0,  0,  0,  0,  0,  0]])
+    print(f"debug. masked_tokens: {masked_tokens}")
+    # debug. masked_tokens: tensor([[24, 16, 17,  0,  0]])
+    print(f"debug. masked_words: {masked_tokens}")
 
-    print(text)
-    print([number_dict[w.item()] for w in input_ids[0] if number_dict[w.item()] != '[PAD]'])
-    # ['[CLS]', '[MASK]', 'romeo', '[MASK]', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]', 'oh', 'congratulations', 'juliet', '[SEP]']
+    print([token_2_word_dict[w.item()] for w in input_ids_bak[0]])
+    print([token_2_word_dict[w.item()] for w in input_ids[0]])
+    # ['[CLS]', 'hello', 'romeo', 'my', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]', 'hello', 'romeo', 'my', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]']
+    # ['[CLS]', 'hello', 'romeo', 'my', 'is', 'is', 'juliet', 'nice', '[MASK]', 'meet', 'you', '[SEP]', 'hello', 'romeo', '[MASK]', 'name', 'is', 'juliet', 'nice', 'to', 'meet', 'you', '[SEP]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]', '[PAD]']
 
     # logits_lm:   [batch_size, max_pred, n_vocab]
     # logits_clsf: [batch_size, 2]
     logits_lm, logits_clsf = model(input_ids, segment_ids, masked_pos)
+
+    # 任务一
+    print("========================== 任务一: MLM ==========================")
+    # [预测值]
     logits_lm = logits_lm.data.max(2)[1][0].data.numpy() # (5,)
-    print(f"debug. after logits_lm.shape: {logits_lm.shape}") # (5,)
+    print('predict masked tokens: ', [token for token in logits_lm if token != 0])
+    # predict masked tokens list:  [19, 19, 19, 19, 19]
+    print('predict masked words: ', show_words([token for token in logits_lm if token != 0], token_2_word_dict))
+    # predict masked tokens:  ['oh', 'oh', 'oh', 'oh', 'oh']
 
-    print('masked tokens list : ', [pos.item() for pos in masked_tokens[0] if pos.item() != 0])
-    # masked tokens list :  [7, 15]
-    print('masked tokens: ', show_words(masked_tokens[0].tolist(), number_dict))
-    # masked tokens:  ['won', 'won', 'the', '[PAD]', '[PAD]']
-    print('masked tokens: ', show_words([pos.item() for pos in masked_tokens[0] if pos.item() != 0], number_dict))
-    # masked tokens:  ['won', 'won', 'the']
+    # [标签值]
+    print('masked tokens: ', [token.item() for token in masked_tokens[0] if token.item() != 0])
+    # masked tokens list :  [24, 16, 17]
+    print('masked words: ', show_words([token.item() for token in masked_tokens[0] if token.item() != 0], token_2_word_dict))
+    # masked tokens:  ['to', 'my', 'name']
 
-    print('predict masked tokens list: ', [pos for pos in logits_lm if pos != 0])
-    # predict masked tokens list :  []
-
+    print("\n========================== 任务二: NSP ==========================")
+    # [预测值]
     logits_clsf = logits_clsf.data.max(1)[1].data.numpy()[0]
-    print('isNext : ', True if isNext else False)
-    # isNext :  False
-
     print('predict isNext : ', True if logits_clsf else False)
     # predict isNext :  False
+
+    # [标签值]
+    print('isNext : ', True if isNext else False)
+    # isNext :  False

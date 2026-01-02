@@ -37,38 +37,30 @@ def make_batch(sentences):
     print(f"input_batch: {input_batch}")    # [[1, 2, 3, 4, 0]]
     print(f"output_batch: {output_batch}")  # [[5, 1, 2, 3, 4]]
     print(f"target_batch: {target_batch}")  # [[1, 2, 3, 4, 6]]
-
-    return (torch.LongTensor(input_batch),
-            torch.LongTensor(output_batch),
-            torch.LongTensor(target_batch))
+    return (torch.LongTensor(input_batch), torch.LongTensor(output_batch),    torch.LongTensor(target_batch))
 
 
 class PositionalEncoding(nn.Module):
     """
-    位置编码另一种实现
+    正弦位置编码. 利用正弦函数的周期性来编码位置信息
+    @param max_len: 位置的总个数
+    @param d_model: 编码后的向量长度
+    @return:        每个位置对应一个编码向量. (max_len, d_model)
     """
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
 
         # torch.Size([max_len, 1])
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-
-        # torch.Size([d_model/2])
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-
-        # torch.Size([max_len, d_model])
+        # 对数换底公式: 10000^{i/d} = exp^{i/d * (ln10000)}
+        div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
+        # pe_{pos, 2i} = sin(pos/10000^{2i/d})
+        # pe_{pos, 2i+1} = sin(pos/10000^{2i/d})
         pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position / div_term)
+        pe[:, 1::2] = torch.cos(position / div_term)
 
-        # position * div_term: torch.Size([max_len, d_model/2])
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        '''
-        参数不更新时使用 register_buffer. 典型场景包括：
-        1) 当你有一个在模型训练过程中不会改变的张量, 但你又需要在模型的前向传播中使用它
-        2) 当你需要在多个地方访问同一个张量, 但又不希望它作为模型参数被优化器更新
-        注意: register_buffer注册后, 可以在forward中使用 self.pe 来操作pe
-        '''
+        # 参数不更新时使用register_buffer. 注册后在forward中使用self.pe来操作pe
         self.register_buffer('pe', pe)
 
     def forward(self, x):
@@ -78,42 +70,26 @@ class PositionalEncoding(nn.Module):
         """
         return self.pe[:x.size(0), :]
 
-
-def get_sinusoid_encoding_table(n_position, d_model):
-    """
-    正弦编码是一种常见的位置编码方法，它利用正弦函数的周期性来编码位置信息
-    @param n_position: 位置的总个数
-    @param d_model:    编码后的向量长度
-    @return:           每个位置对应一个编码向量. torch.Size([n_position, d_model])
-    """
-    def cal_angle(position, hid_idx):
-        # 注意: hid_idx // 2 导致每列数据会重复两次
-        return position / np.power(10000, 2 * (hid_idx // 2) / d_model)
-
-    def get_posi_angle_vec(position):
-        return [cal_angle(position, hid_j) for hid_j in range(d_model)]
-
-    # 二维数组
-    sinusoid_table = [get_posi_angle_vec(pos) for pos in range(n_position)]
-    sinusoid_table = np.array(sinusoid_table)
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
-    print(f"sinusoid_table : {sinusoid_table}, size: {sinusoid_table.shape}") # (n_position, d_model)
-    return torch.FloatTensor(sinusoid_table)
+def get_positional_encoding_table(max_len, d_model):
+    # (max_len, 1)
+    position = np.arange(max_len)[:, np.newaxis]
+    # 2i/d_model
+    div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
+    pe = np.zeros((max_len, d_model))
+    pe[:, 0::2] = np.sin(position * div_term)
+    pe[:, 1::2] = np.cos(position * div_term)
+    return torch.FloatTensor(pe)
 
 
 def get_attn_pad_mask(seq_q, seq_k):
     """
-    attention中两个mask之一, 另一个是get_attn_sequent_mask()
-
-    为什么需要pad_mask掩码?
-    序列往往包含"填充元素"（padding）以保持固定长度. 但是这些元素不包含有用的信息, 在计算注意力权重时需要被屏蔽掉(忽略zero padding词)
+    pad_mask掩码. attention中两个mask之一, 另一个是get_attn_sequent_mask
+    序列往往包含填充元素padding(不包含有用的信息)以保持固定长度
     @seq_q : [batch_size, len_q]
     @seq_k : [batch_size, len_k]. 对于decoder, 这里是encoder_input
     @:return: [batch_size, len_q, len_k]
     """
-
-    # 这两个序列通常来自同一个输入序列，但可能经过不同的处理
+    # 这两个序列通常来自同一个输入序列, 但可能经过不同的处理
     _, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
 
@@ -128,16 +104,11 @@ def get_attn_pad_mask(seq_q, seq_k):
 
 def get_attn_subsequent_mask(seq):
     """
-    attention中两个mask之一, 另一个是get_attn_pad_mask()
-    仅用于Decoder的Masked Multi-Head Self-attention中.
-
-    subsequent mask掩码用于处理序列数据, 它会与自注意力层的输出相乘, 以屏蔽序列中后续位置, 以确保解码器只能使用之前的输出来预测下一个输出
-    序列生成任务中(如自回归模型)，模型在预测当前词时不应该使用未来信息(即未来词), 从而让模型正确学习序列元素之间的依赖关系，同时保持预测的一致性
-
+    因果掩码, attention中两个mask之一, 仅用于Decoder的Masked MSA中. 另一个是get_attn_pad_mask()
+    序列生成任务中(如自回归模型), 因果掩码与自注意力层的输出相乘以屏蔽序列中后续位置, 从而让模型正确学习序列元素之间的依赖关系, 同时保持预测的一致性
     @seq: [batch_size, tgt_seq_len]
     @return: [batch_size, tgt_seq_len, tgt_seq_len]
     """
-
     # [batch_size, tgt_seq_len, tgt_seq_len]
     attn_shape = [seq.size(0), seq.size(1), seq.size(1)]
 
@@ -205,7 +176,6 @@ def show_graph(attn, text):
     plt.title(text)
 
     plt.show()
-
 
 
 def greedy_decoder(model, enc_input, start_symbol):
@@ -304,12 +274,13 @@ class Encoder(nn.Module):
         # 词表emb矩阵, [src_vocab_size, d_model]
         self.src_emb = nn.Embedding(src_vocab_size, d_model)
 
-        # 输入词序列的位置编码矩阵, [src_seq_len, d_model]
-        # 方式一
+        # 位置编码矩阵, [src_seq_len, d_model]
+        # 方式1
         # self.pos_emb = nn.Embedding.from_pretrained(
-        #     get_sinusoid_encoding_table(src_seq_len, d_model),
-        #     freeze=True)
-        # 方式二
+        #     get_positional_encoding_table(d_model, src_seq_len),
+        #     freeze=True
+        # )
+        # 方式2
         self.pos_emb = PositionalEncoding(d_model=d_model, max_len=src_seq_len)
 
         # N个EncoderBlock的堆叠
@@ -348,7 +319,6 @@ class Encoder(nn.Module):
             # 3.3. 迭代. 将输出作为输入
             enc_inputs = enc_outputs
         return enc_outputs, enc_self_attns
-
 
 
 class EncoderLayer(nn.Module):
@@ -467,7 +437,6 @@ class ScaledDotProductAttention(nn.Module):
     """
     点乘(内积)的Attention
     """
-
     def __init__(self):
         super(ScaledDotProductAttention, self).__init__()
 
@@ -515,46 +484,31 @@ class ScaledDotProductAttention(nn.Module):
 
 class PoswiseFeedForwardNet(nn.Module):
     """
-    pos-wise 前馈网络
-    todo: 为什么要使用卷积层Conv1d(), 而不是直接使用全连接层Linear()
+    逐点卷积/一维卷积(pointwise convolution): 卷积核的大小为1, 等价与全连接层
+    kernel_size=1卷积核只覆盖序列中单个元素. 对序列中的每个位置独立地应用相同的变换, 不会捕捉序列中元素之间的依赖关系
     """
-
     def __init__(self):
         super(PoswiseFeedForwardNet, self).__init__()
 
-        # kernel_size=1卷积核只覆盖序列中单个元素, “逐点卷积”（pointwise convolution), 不会捕捉序列中元素之间的依赖关系, 而是对每个单独的元素应用一个线性变换
-        # 第一层卷积(全连接层)
         self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
         self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
-
-        # LN层
         self.layer_norm = nn.LayerNorm(d_model)
 
     def forward(self, inputs):
         """
-        通过使用较小的卷积核和较大的输出通道数，模型可以在不改变序列长度的情况下，学习更丰富的特征表示
-        此外，由于卷积核的大小为1，这种操作实际上是一个全连接层，它对序列中的每个位置独立地应用相同的变换，这有助于保持位置不变性
         # inputs : [batch_size, len_q, d_model]
         """
-
         # Step1. 备份输入, 后续用于残差输入
         # [batch_size, len_q, d_model]
         residual = inputs
 
-        # Step2. 经过一层全连接层
-        # 卷积层期望输入的形状为(batch_size, in_channels, sequence_length)
-        # 对于一维卷积来说，in_channels通常对应于特征的数量d_model
-        # [batch_size, d_model, len_q] 经过卷积 [d_model, d_ff] = [batch_size, d_ff, len_q]
+        # Step2. 经过一维卷积层(等价于全连接层)
+        # [batch_size, d_model, len_q]经过conv1卷积后[batch_size, d_ff, len_q]
         output = nn.ReLU()(self.conv1(inputs.transpose(1, 2)))
-
-        # [batch_size, d_ff, len_q] 经过卷积 [d_ff, d_model] = [batch_size, d_model, len_q]
-        output = self.conv2(output)
-
         # [batch_size, len_q, d_model]
-        output = output.transpose(1, 2)
+        output = self.conv2(output).transpose(1, 2)
 
         # Step3. 经过LN层
-        # output: [batch_size, len_q, d_model]
         return self.layer_norm(output + residual)
 
 
@@ -583,7 +537,6 @@ class Decoder(nn.Module):
         @enc_outputs: [batch_size, src_seq_len, d_model]
         @return:
         """
-
         # Step1. decoder的输入(emb + 位置编码)
         # dec_outputs = self.tgt_emb(dec_inputs) + self.pos_emb(torch.LongTensor([[5, 1, 2, 3, 4]]))
         # dec_outputs: [batch_size, tgt_seq_len, d_model]

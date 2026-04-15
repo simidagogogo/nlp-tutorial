@@ -41,34 +41,39 @@ def make_batch(sentences):
 
 
 class PositionalEncoding(nn.Module):
+    """正余弦绝对位置编码
+    :param max_len: 位置的总个数
+    :param d_model: 编码后的向量长度
+    :param dropout: dropout ratio
+    :return:        每个位置对应一个编码向量. (max_len, d_model)
     """
-    正弦位置编码. 利用正弦函数的周期性来编码位置信息
-    @param max_len: 位置的总个数
-    @param d_model: 编码后的向量长度
-    @return:        每个位置对应一个编码向量. (max_len, d_model)
-    """
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
+        super().__init__()
 
-        # torch.Size([max_len, 1])
+        self.dropout = nn.Dropout(p=dropout)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        # 对数换底公式: 10000^{i/d} = exp^{i/d * (ln10000)}
-        div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
-        # pe_{pos, 2i} = sin(pos/10000^{2i/d})
-        # pe_{pos, 2i+1} = sin(pos/10000^{2i/d})
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position / div_term)
-        pe[:, 1::2] = torch.cos(position / div_term)
+        # 对数换底公式: 
+        #   10000^{i/d}  = exp^{i/d * (ln10000)}
+        #   10000^{-i/d} = exp^{-i/d * (ln10000)}
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
 
-        # 参数不更新时使用register_buffer. 注册后在forward中使用self.pe来操作pe
+        # pe_{pos, 2i}   = sin(pos/10000^{2i/d})
+        # pe_{pos, 2i+1} = cos(pos/10000^{2i+1/d})
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        # 使用register_buffer注册不更新参数. 在forward中使用self.pe
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         """
-        x: [batch_size, seq_len]
-        @return: [batch_size, seq_len, d_model]
+        :param x: [batch_size, seq_len]
+        :return: [batch_size, seq_len, d_model]
         """
-        return self.pe[:x.size(0), :]
+        x = x + self.pe[:x.size(1), :].unsqueeze(0)
+        return self.dropout(x)
+
 
 def get_positional_encoding_table(max_len, d_model):
     # (max_len, 1)
@@ -85,9 +90,10 @@ def get_attn_pad_mask(seq_q, seq_k):
     """
     pad_mask掩码. attention中两个mask之一, 另一个是get_attn_sequent_mask
     序列往往包含填充元素padding(不包含有用的信息)以保持固定长度
-    @seq_q : [batch_size, len_q]
-    @seq_k : [batch_size, len_k]. 对于decoder, 这里是encoder_input
-    @:return: [batch_size, len_q, len_k]
+
+    :param seq_q : [batch_size, len_q]
+    :param seq_k : [batch_size, len_k]. 对于decoder, 这里是encoder_input
+    :return: [batch_size, len_q, len_k]
     """
     # 这两个序列通常来自同一个输入序列, 但可能经过不同的处理
     _, len_q = seq_q.size()
@@ -106,8 +112,9 @@ def get_attn_subsequent_mask(seq):
     """
     因果掩码, attention中两个mask之一, 仅用于Decoder的Masked MSA中. 另一个是get_attn_pad_mask()
     序列生成任务中(如自回归模型), 因果掩码与自注意力层的输出相乘以屏蔽序列中后续位置, 从而让模型正确学习序列元素之间的依赖关系, 同时保持预测的一致性
-    @seq: [batch_size, tgt_seq_len]
-    @return: [batch_size, tgt_seq_len, tgt_seq_len]
+
+    :param seq: [batch_size, tgt_seq_len]
+    :param return: [batch_size, tgt_seq_len, tgt_seq_len]
     """
     # [batch_size, tgt_seq_len, tgt_seq_len]
     attn_shape = [seq.size(0), seq.size(1), seq.size(1)]
@@ -174,7 +181,6 @@ def show_graph(attn, text):
     plt.xlabel("encoder input")
     plt.ylabel("label")
     plt.title(text)
-
     plt.show()
 
 
@@ -230,9 +236,9 @@ class Transformer(nn.Module):
 
     def forward(self, enc_inputs, dec_inputs):
         """
-        @enc_inputs:  (batch_size, src_seq_len). 原始的text to sequence编码, 形如 [[1, 2, 3, 4, 0]]
-        @dec_inputs: (batch_size, tgt_seq_len). 原始的text to sequence编码, 形如 [[5, 1, 2, 3, 4]]
-        @return:
+        :param enc_inputs:  (batch_size, src_seq_len). 原始的text to sequence编码, 形如 [[1, 2, 3, 4, 0]]
+        :param dec_inputs: (batch_size, tgt_seq_len). 原始的text to sequence编码, 形如 [[5, 1, 2, 3, 4]]
+        :return:
             dec_logits: [batch_size * tgt_seq_len, tgt_vocab_size]
             enc_self_attns: List[[batch_size, n_heads, src_seq_len, src_seq_len]]
             dec_self_attns: List[[batch_size, n_heads, tgt_seq_len, tgt_seq_len]]
@@ -276,12 +282,13 @@ class Encoder(nn.Module):
 
         # 位置编码矩阵, [src_seq_len, d_model]
         # 方式1
+        self.pos_emb = PositionalEncoding(d_model=d_model, max_len=src_seq_len)
+
+        # 方式2
         # self.pos_emb = nn.Embedding.from_pretrained(
         #     get_positional_encoding_table(d_model, src_seq_len),
         #     freeze=True
         # )
-        # 方式2
-        self.pos_emb = PositionalEncoding(d_model=d_model, max_len=src_seq_len)
 
         # N个EncoderBlock的堆叠
         self.layers = nn.ModuleList([EncoderLayer() for _ in range(n_layers)])
@@ -289,8 +296,8 @@ class Encoder(nn.Module):
 
     def forward(self, enc_inputs):
         """
-        @enc_inputs : [batch_size, src_seq_len]. 原始的one-hot编码结果
-        :return  [batch_size, src_seq_len, d_model]
+        :param enc_inputs : [batch_size, src_seq_len]. 原始的one-hot编码结果
+        :return: [batch_size, src_seq_len, d_model]
         """
 
         # 1. 计算自注意力掩码
@@ -298,8 +305,7 @@ class Encoder(nn.Module):
         enc_self_attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs)
 
         # 2. 计算encoder层输入
-        # enc_outputs: [batch_size, src_seq_len, d_model]
-        enc_inputs = self.src_emb(enc_inputs) + self.pos_emb(enc_inputs)
+        enc_inputs = self.pos_emb(self.src_emb(enc_inputs))
 
         # 3. 计算经过各个EncoderBlock
         # 用于记录attention的相关系数, 用于可视化
@@ -336,8 +342,8 @@ class EncoderLayer(nn.Module):
 
     def forward(self, enc_inputs, enc_self_attn_mask):
         """
-        @enc_inputs : [batch_size, src_seq_len, d_model]
-        @enc_self_attn_mask: [batch_size, len_query, len_key]
+        :param enc_inputs : [batch_size, src_seq_len, d_model]
+        :param enc_self_attn_mask: [batch_size, len_query, len_key]
         """
 
         # Part1. Self Attention Sublayer
@@ -442,14 +448,14 @@ class ScaledDotProductAttention(nn.Module):
 
     def forward(self, Q, K, V, attn_mask):
         """
-        Q: [batch_size, n_heads, len_q, d_k]
-        K: [batch_size, n_heads, len_k, d_k]
-        V: [batch_size, n_heads, len_v, d_v]
-        attn_mask: [batch_size, n_heads, len_q, len_k]
-        @:return context: 经过Attention加权之后的V
-        @:return attn: Q和K计算所得权重值的Softmax归一化概率值
+        :param Q: [batch_size, n_heads, len_q, d_k]
+        :param K: [batch_size, n_heads, len_k, d_k]
+        :param V: [batch_size, n_heads, len_v, d_v]
+        :param attn_mask: [batch_size, n_heads, len_q, len_k]
+        :return 
+            context: 经过Attention加权之后的V
+            attn: Q和K计算所得权重值的Softmax归一化概率值
         """
-
         # Step1. 计算score
         # [batch_size, n_heads, d_k, len_k]
         K_transponse = K.transpose(-1, -2)
@@ -523,25 +529,28 @@ class Decoder(nn.Module):
         self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model)
 
         # 输入词序列的位置编码矩阵, [tgt_seq_len, d_model]
-        self.pos_emb = nn.Embedding.from_pretrained(
-            get_sinusoid_encoding_table(tgt_seq_len + 1, d_model),
-            freeze=True)
+        # 方式1
+        self.pos_emb = PositionalEncoding(d_model=d_model, max_len=tgt_seq_len + 1)
+
+        # 方式2
+        # self.pos_emb = nn.Embedding.from_pretrained(
+        #     get_positional_encoding_table(tgt_seq_len + 1, d_model),
+        #     freeze=True
+        # )
 
         # DecoderBlock堆叠层
         self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)])
 
     def forward(self, dec_inputs, enc_inputs, enc_outputs):
         """
-        @dec_inputs : [batch_size, tgt_seq_len]
-        @enc_inputs:  [batch_size, src_seq_len]
-        @enc_outputs: [batch_size, src_seq_len, d_model]
-        @return:
+        :param dec_inputs : [batch_size, tgt_seq_len]
+        :param enc_inputs:  [batch_size, src_seq_len]
+        :param enc_outputs: [batch_size, src_seq_len, d_model]
+        :return:
         """
         # Step1. decoder的输入(emb + 位置编码)
-        # dec_outputs = self.tgt_emb(dec_inputs) + self.pos_emb(torch.LongTensor([[5, 1, 2, 3, 4]]))
         # dec_outputs: [batch_size, tgt_seq_len, d_model]
-        dec_outputs = self.tgt_emb(dec_inputs) + self.pos_emb(dec_inputs)
-
+        dec_outputs = self.pos_emb(self.tgt_emb(dec_inputs) )
 
         # Step2. decoder中的自注意力层的mask(decoder这里有两个mask)
         # Step2.1. pad mask
@@ -598,10 +607,10 @@ class DecoderLayer(nn.Module):
 
     def forward(self, dec_inputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask):
         """
-        @dec_inputs: 解码器的输入,  [batch_size, tgt_seq_len, d_model]
-        @enc_outputs: 编码器的输出, [batch_size, src_seq_len, d_model]
-        @dec_self_attn_mask: 解码器的 自注意力mask, [batch_size, tgt_seq_len, tgt_seq_len]. padding_mask + subsequent_mask两者相加
-        @dec_enc_attn_mask : 解码器的 互注意力mask, [batch_size, tgt_seq_len, src_seq_len]. 仅包含padding_mask
+        :param dec_inputs: 解码器的输入,  [batch_size, tgt_seq_len, d_model]
+        :param enc_outputs: 编码器的输出, [batch_size, src_seq_len, d_model]
+        :param dec_self_attn_mask: 解码器的 自注意力mask, [batch_size, tgt_seq_len, tgt_seq_len]. padding_mask + subsequent_mask两者相加
+        :param dec_enc_attn_mask : 解码器的 互注意力mask, [batch_size, tgt_seq_len, src_seq_len]. 仅包含padding_mask
         """
 
         # Part1. 自注意力层. Q, K和V来自decoder

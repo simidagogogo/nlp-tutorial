@@ -108,7 +108,7 @@ def get_attn_pad_mask(seq_q, seq_k):
     return pad_mask.expand(batch_size, len_q, len_k)
 
 
-def get_attn_subsequent_mask(seq):
+def get_attn_causal_mask(seq):
     """
     因果掩码, attention中两个mask之一, 仅用于Decoder的Masked MSA中. 另一个是get_attn_pad_mask()
     序列生成任务中(如自回归模型), 因果掩码与自注意力层的输出相乘以屏蔽序列中后续位置, 从而让模型正确学习序列元素之间的依赖关系, 同时保持预测的一致性
@@ -119,16 +119,16 @@ def get_attn_subsequent_mask(seq):
     # [batch_size, tgt_seq_len, tgt_seq_len]
     attn_shape = [seq.size(0), seq.size(1), seq.size(1)]
 
-    # 创建subsequent mask(上三角矩阵): 对角线以上的元素为1(不包括对角线)，其余元素都为0
+    # 创建causal mask(上三角矩阵): 对角线以上的元素为1(不包括对角线)，其余元素都为0
     # one is masking
-    subsequent_mask = np.triu(np.ones(attn_shape), k=1)
+    causal_mask = np.triu(np.ones(attn_shape), k=1)
 
     # 将NumPy数组转换为PyTorch张量，因为后续操作需要在计算图中进行
-    # subsequent_mask = torch.ByteTensor(subsequent_mask)
-    subsequent_mask = torch.from_numpy(subsequent_mask).byte()
+    # causal_mask = torch.ByteTensor(causal_mask)
+    causal_mask = torch.from_numpy(causal_mask).byte()
 
     # [batch_size, tgt_seq_len, tgt_seq_len]
-    return subsequent_mask
+    return causal_mask
 
 
 def show_graph(attn, text):
@@ -548,48 +548,41 @@ class Decoder(nn.Module):
         :param enc_outputs: [batch_size, src_seq_len, d_model]
         :return:
         """
-        # Step1. decoder的输入(emb + 位置编码)
-        # dec_outputs: [batch_size, tgt_seq_len, d_model]
-        dec_outputs = self.pos_emb(self.tgt_emb(dec_inputs) )
 
-        # Step2. decoder中的自注意力层的mask(decoder这里有两个mask)
-        # Step2.1. pad mask
-        # dec_self_attn_pad_mask: [batch_size, tgt_seq_len, tgt_seq_len]
+        # decoder中的自注意力层的mask(decoder这里有两个mask)
+        # pad mask. [batch_size, tgt_seq_len, tgt_seq_len]
         dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs)
+        # causal mask. [batch_size, tgt_seq_len, tgt_seq_len]
+        dec_self_attn_causal_mask = get_attn_causal_mask(dec_inputs)
+        # [batch_size, tgt_seq_len, tgt_seq_len]
+        dec_self_attn_mask = torch.gt((dec_self_attn_pad_mask + dec_self_attn_causal_mask), 0)
 
-        # Step2.2. subsequent mask
-        # dec_self_attn_subsequent_mask: [batch_size, tgt_seq_len, tgt_seq_len]
-        dec_self_attn_subsequent_mask = get_attn_subsequent_mask(dec_inputs)
-
-        # Step2.3. 两者相加
-        # dec_self_attn_mask: [batch_size, tgt_seq_len, tgt_seq_len]
-        dec_self_attn_mask = torch.gt((dec_self_attn_pad_mask + dec_self_attn_subsequent_mask), 0)
-
-
-        # Step3. 交互自注意力层的mask(enc_inputs仅仅用于获取mask的形状)
-        # dec_enc_attn_mask: [batch_size, tgt_seq_len, src_seq_len]
+        # 交互自注意力层的mask(enc_inputs仅仅用于获取mask的形状)
+        # [batch_size, tgt_seq_len, src_seq_len]
         dec_enc_attn_mask = get_attn_pad_mask(dec_inputs, enc_inputs)
 
+        # decoder的输入(emb + 位置编码)
+        # [batch_size, tgt_seq_len, d_model]
+        dec_inputs_ = self.pos_emb(self.tgt_emb(dec_inputs))
 
-        # Step4. DecoderBlock堆叠层
-        # 列表的长度就是decoder的层数
+        # DecoderBlock堆叠层
         dec_self_attns = []
         dec_enc_attns = []
         for layer in self.layers:
-            # dec_outputs  : [batch_size, tgt_seq_len, d_model]
+            # dec_inputs_  : [batch_size, tgt_seq_len, d_model]
             # dec_self_attn: [batch_size, n_heads, tgt_seq_len, tgt_seq_len]
             # dec_enc_attn : [batch_size, n_heads, tgt_seq_len, src_seq_len]
-            dec_outputs, dec_self_attn, dec_enc_attn = layer(dec_outputs,       # decoder输入  (每层DecodeBlock不同)
-                                                             enc_outputs,       # encoder输入  (每层DecodeBlock相同)
+            dec_inputs_, dec_self_attn, dec_enc_attn = layer(dec_inputs_,       # decoder输入(作为dec_self_attn的QKV)  (每层DecodeBlock不同)
+                                                             enc_outputs,       # encoder输入(作为dec_enc_attn的KV)  (每层DecodeBlock相同)
                                                              dec_self_attn_mask,# 自注意力层mask(每层DecodeBlock相同)
                                                              dec_enc_attn_mask) # 互注意力层mask(每层DecodeBlock相同)
             dec_self_attns.append(dec_self_attn)
             dec_enc_attns.append(dec_enc_attn)
 
-        # dec_outputs: [batch_size, tgt_seq_len, d_model]
+        # dec_inputs_: [batch_size, tgt_seq_len, d_model]
         # dec_self_attns: List[[batch_size, n_heads, tgt_seq_len, tgt_seq_len]]
         # dec_enc_attns:  List[[batch_size, n_heads, tgt_seq_len, src_seq_len]]
-        return dec_outputs, dec_self_attns, dec_enc_attns
+        return dec_inputs_, dec_self_attns, dec_enc_attns
 
 
 class DecoderLayer(nn.Module):
@@ -607,28 +600,28 @@ class DecoderLayer(nn.Module):
 
     def forward(self, dec_inputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask):
         """
-        :param dec_inputs: 解码器的输入,  [batch_size, tgt_seq_len, d_model]
-        :param enc_outputs: 编码器的输出, [batch_size, src_seq_len, d_model]
-        :param dec_self_attn_mask: 解码器的 自注意力mask, [batch_size, tgt_seq_len, tgt_seq_len]. padding_mask + subsequent_mask两者相加
+        :param dec_inputs: 解码器的输入(作为self-attn的QKV),  [batch_size, tgt_seq_len, d_model]
+        :param enc_outputs: 编码器的输出(作为dec_enc_attn的KV), [batch_size, src_seq_len, d_model]
+        :param dec_self_attn_mask: 解码器的 自注意力mask, [batch_size, tgt_seq_len, tgt_seq_len]. padding_mask + causal_mask两者相加
         :param dec_enc_attn_mask : 解码器的 互注意力mask, [batch_size, tgt_seq_len, src_seq_len]. 仅包含padding_mask
         """
 
         # Part1. 自注意力层. Q, K和V来自decoder
-        # dec_outputs: [batch_size, tgt_seq_len, d_modal]
+        # dec_outputs: [batch_size, tgt_seq_len, d_modal], 作为dec_enc_attn的Q
         # dec_self_attn: [batch_size, n_heads, tgt_seq_len, tgt_seq_len]
-        dec_outputs, dec_self_attn = self.dec_self_attn(dec_inputs,  # Q, [batch_size, tgt_seq_len, d_model]
-                                                        dec_inputs,  # K, [batch_size, tgt_seq_len, d_model]
-                                                        dec_inputs,  # V, [batch_size, tgt_seq_len, d_model]
+        dec_outputs, dec_self_attn = self.dec_self_attn(dec_inputs,         # Q, [batch_size, tgt_seq_len, d_model]
+                                                        dec_inputs,         # K, [batch_size, tgt_seq_len, d_model]
+                                                        dec_inputs,         # V, [batch_size, tgt_seq_len, d_model]
                                                         dec_self_attn_mask  # [batch_size, tgt_seq_len, tgt_seq_len]
                                                         )
 
         # Part2. 交互注意力层. Q来自decoder, K和V来自encoder
         # dec_outputs: [batch_size, tgt_seq_len, d_modal]
         # dec_enc_attn: [batch_size, n_heads, tgt_seq_len, src_seq_len]
-        dec_outputs, dec_enc_attn = self.dec_enc_attn(dec_outputs,  # Q, [batch_size, tgt_seq_len, d_modal]
-                                                      enc_outputs,  # K, [batch_size, src_seq_len, d_model]
-                                                      enc_outputs,  # V, [batch_size, src_seq_len, d_model]
-                                                      dec_enc_attn_mask # [batch_size, tgt_seq_len, src_seq_len]
+        dec_outputs, dec_enc_attn = self.dec_enc_attn(dec_outputs,          # Q, [batch_size, tgt_seq_len, d_modal]
+                                                      enc_outputs,          # K, [batch_size, src_seq_len, d_model]
+                                                      enc_outputs,          # V, [batch_size, src_seq_len, d_model]
+                                                      dec_enc_attn_mask     # [batch_size, tgt_seq_len, src_seq_len]
                                                       )
 
         # Part3. FFN层
